@@ -11,6 +11,7 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,7 +21,7 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
+    command:
       - start-dev
       - --import-realm
     volumes:
@@ -29,6 +30,57 @@ services:
       - "8080:8080"
     depends_on:
       - keycloak_db
+      
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./clickhouse-data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: bionic
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:23.8
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./clickhouse-init:/init
+    entrypoint: |
+      bash -c '
+      echo "Waiting for ClickHouse to be ready..."
+      sleep 2
+      clickhouse-client --host clickhouse --port 9000 --multiquery < /init/clickHouseTable.sql
+      echo "Initialization completed."
+      '
+    restart: "no"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: reports-realm
+      REACT_APP_API_URL: http://localhost:8000   # для внутренних нужд (не обязательно)
+    depends_on:
+      - keycloak
+      - clickhouse
+    restart: unless-stopped
+
   frontend:
     build:
       context: ./frontend
@@ -40,3 +92,5 @@ services:
       REACT_APP_KEYCLOAK_URL: http://localhost:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+    depends_on:
+      - backend
