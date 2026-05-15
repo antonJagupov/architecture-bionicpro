@@ -1,4 +1,0 @@
-pandas==2.2.3
-clickhouse-connect==0.8.7
-apache-airflow-providers-postgres==5.13.0
-apache-airflow-providers-http==4.15.0
