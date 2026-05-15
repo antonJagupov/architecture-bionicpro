@@ -1,31 +1,31 @@
-# Build stage
-FROM node:16-alpine as build
-
+# Этап сборки
+FROM node:18-alpine AS build
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json ./
-
-# Install dependencies
+# Копируем package.json и устанавливаем зависимости
+COPY package*.json ./
 RUN npm ci
 
-# Copy source code
+# Копируем исходники
 COPY . .
 
-# Build the app
+# Принимаем переменные окружения как аргументы сборки
+ARG REACT_APP_API_URL
+ARG REACT_APP_KEYCLOAK_URL
+ARG REACT_APP_KEYCLOAK_REALM
+ARG REACT_APP_KEYCLOAK_CLIENT_ID
+
+# Передаём их в окружение сборки
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
+ENV REACT_APP_KEYCLOAK_URL=$REACT_APP_KEYCLOAK_URL
+ENV REACT_APP_KEYCLOAK_REALM=$REACT_APP_KEYCLOAK_REALM
+ENV REACT_APP_KEYCLOAK_CLIENT_ID=$REACT_APP_KEYCLOAK_CLIENT_ID
+
+# Сборка приложения
 RUN npm run build
 
-# Production stage
+# Этап сервера (nginx)
 FROM nginx:alpine
-
-# Copy built assets from build stage
 COPY --from=build /app/build /usr/share/nginx/html
-
-# Copy nginx configuration
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-
-# Expose port
-EXPOSE 3000
-
-# Start nginx
+EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]
