@@ -1,35 +1,69 @@
-# main.py (FastAPI)
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 import jwt
+from jwt import PyJWKClient
 import clickhouse_connect
-from datetime import date, datetime, timedelta
 import os
+from datetime import date, datetime
 
-app = FastAPI(title="Bionic Report Service")
+app = FastAPI()
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 security = HTTPBearer()
 
-# Настройки
-CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
-KEYCLOAK_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----..."""  # Публичный ключ Keycloak
+# Конфигурация Keycloak
+KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "http://localhost:8080")
+REALM = os.getenv("KEYCLOAK_REALM", "reports-realm")
+JWKS_URL = f"http://keycloak:8080/realms/{REALM}/protocol/openid-connect/certs"
+
+# Клиент для получения JWKS (публичных ключей)
+jwks_client = PyJWKClient(JWKS_URL)
 
 # Подключение к ClickHouse
-ch_client = clickhouse_connect.get_client(host=CLICKHOUSE_HOST, port=8123, database="bionic")
+CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
+CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", 8123))
+ch_client = clickhouse_connect.get_client(host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT, database="bionic")
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     try:
-        payload = jwt.decode(token, KEYCLOAK_PUBLIC_KEY, algorithms=["RS256"], audience="bionic-api")
-        user_id = payload.get("sub")  # или кастомный claim
+        # Получаем signing key из JWKS
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        # Декодируем и проверяем подпись, audience, issuer
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience="reports-frontend",   # clientId вашего фронтенда
+            options={"verify_aud": False}
+        )
+        # Проверяем issuer
+        expected_issuer = f"{KEYCLOAK_URL}/realms/{REALM}"
+        if payload.get("iss") != expected_issuer:
+            raise jwt.InvalidIssuerError("Invalid issuer")
+        
+        user_id = payload.get("sub")
         if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return int(user_id)  # предполагаем, что user_id в токене — числовой
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Could not validate credentials")
+            raise HTTPException(status_code=401, detail="Invalid token: missing subject")
+        # Можно попробовать преобразовать в int, но sub обычно строка (UUID)
+        return user_id
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Could not validate credentials: {str(e)}")
 
 @app.get("/reports")
 def get_report(
-    current_user: int = Depends(get_current_user),
+    current_user: str  = Depends(get_current_user),
     start_date: date = Query(..., description="Начальная дата отчёта (YYYY-MM-DD)"),
     end_date: date = Query(..., description="Конечная дата отчёта (YYYY-MM-DD)")
 ):
