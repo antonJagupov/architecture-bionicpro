@@ -2,9 +2,10 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.clickhouse.hooks.clickhouse import ClickHouseHook
-import requests
+import clickhouse_connect
 import pandas as pd
+import requests
+import json
 from io import StringIO
 
 default_args = {
@@ -19,33 +20,28 @@ dag = DAG(
     'bionic_daily_report_etl',
     default_args=default_args,
     description='ETL for user reports from CRM and telemetry',
-    schedule_interval='0 2 * * *',  # ежедневно в 2:00
+    schedule_interval='0 2 * * *',
     catchup=False,
     tags=['bionic', 'reports'],
 )
 
 def extract_crm(**context):
     """Извлечение данных из CRM (Битрикс24) через REST API"""
-    # Пример: получаем список пользователей с полями
-    # В реальности нужно использовать OAuth и пагинацию
-    crm_url = "https://bionic.bitrix24.ru/rest/1/user.get"
-    params = {
-        'auth': 'your_webhook_key',
-        'FILTER': {'ACTIVE': 'Y'},
-        'SELECT': ['ID', 'NAME', 'LAST_NAME', 'UF_PROSTHESIS_SN']
-    }
-    response = requests.get(crm_url, params=params)
-    data = response.json()
-    # Преобразуем в DataFrame
-    users_df = pd.json_normalize(data['result'])
-    # Сохраняем в XCom или временный файл
+    # Заглушка: в реальности используйте OAuth и пагинацию
+    # Здесь имитируем получение данных
+    # Пример ответа от CRM:
+    crm_data = [
+        {"ID": 1, "NAME": "User", "LAST_NAME": "One", "UF_PROSTHESIS_SN": "PR-001"},
+        {"ID": 2, "NAME": "User", "LAST_NAME": "Two", "UF_PROSTHESIS_SN": "PR-002"},
+    ]
+    users_df = pd.DataFrame(crm_data)
     context['ti'].xcom_push(key='crm_users', value=users_df.to_json())
     return 'CRM extracted'
 
 def extract_telemetry(**context):
     """Извлечение телеметрии из PostgreSQL за вчерашний день"""
     pg_hook = PostgresHook(postgres_conn_id='bionic_postgres')
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    yesterday = (datetime.now() - timedelta(days=0)).strftime('%Y-%m-%d')
     sql = f"""
         SELECT user_id, timestamp, movement_type, response_time_ms, battery_voltage
         FROM telemetry
@@ -64,26 +60,56 @@ def transform_and_load(**context):
     users_df = pd.read_json(users_json)
     tele_df = pd.read_json(tele_json)
 
+    if tele_df.empty:
+        print("No telemetry data for yesterday, skipping load.")
+        return "No data"
+
     # Агрегация телеметрии по пользователю и дате
-    tele_df['report_date'] = pd.to_datetime(tele_df['timestamp']).dt.date
+    tele_df['timestamp'] = pd.to_datetime(tele_df['timestamp'])
+    tele_df['report_date'] = tele_df['timestamp'].dt.date
+    tele_df['user_id'] = tele_df['user_id'].astype(str)
+    
     agg = tele_df.groupby(['user_id', 'report_date']).agg(
         total_movements=('movement_type', 'count'),
         avg_response_ms=('response_time_ms', 'mean'),
-        battery_drain_pct=('battery_voltage', lambda x: (x.max() - x.min()) / x.max() * 100),
+        battery_drain_pct=('battery_voltage', lambda x: (x.max() - x.min()) / x.max() * 100 if x.max() != 0 else 0),
         session_count=('timestamp', lambda x: x.diff().gt(pd.Timedelta(minutes=5)).cumsum().nunique())
     ).reset_index()
 
-    # Присоединяем данные CRM (например, firmware_version из кастомного поля)
-    # Допустим, что в CRM хранится серийный номер протеза, по которому можно получить версию прошивки
-    # Для простоты оставим пока пустым
+    # Добавляем версию прошивки (для примера)
     agg['firmware_version'] = 'v2.1'
+    agg['user_id'] = agg['user_id'].astype(str)
 
-    # Загрузка в ClickHouse
-    ch_hook = ClickHouseHook(clickhouse_conn_id='bionic_clickhouse')
-    # Очистка за этот день (чтобы избежать дублей)
-    ch_hook.run(f"ALTER TABLE bionic.user_daily_report DELETE WHERE report_date = '{agg['report_date'].iloc[0]}'")
-    # Вставка через DataFrame
-    ch_hook.insert_dataframe(table='bionic.user_daily_report', dataframe=agg)
+    # Подключение к ClickHouse
+    ch_client = clickhouse_connect.get_client(
+        host='clickhouse',
+        port=8123,
+        username='default',
+        password=''
+    )
+    # Создаём базу данных и таблицу, если не существуют
+    ch_client.command("CREATE DATABASE IF NOT EXISTS bionic")
+    ch_client.command("""
+        CREATE TABLE IF NOT EXISTS bionic.user_daily_report (
+            user_id          String,
+            report_date      Date,
+            total_movements  UInt32,
+            avg_response_ms  Float32,
+            battery_drain_pct Float32,
+            session_count    UInt32,
+            firmware_version String
+        ) ENGINE = MergeTree()
+        PARTITION BY toYYYYMM(report_date)
+        ORDER BY (user_id, report_date)
+    """)
+
+    # Удаляем данные за этот день (чтобы избежать дублирования)
+    report_date = agg['report_date'].iloc[0]
+    ch_client.command(f"ALTER TABLE bionic.user_daily_report DELETE WHERE report_date = '{report_date}'")
+
+    # Вставка данных
+    ch_client.insert_df(table='bionic.user_daily_report', dataframe=agg)
+
     return 'Load completed'
 
 with dag:
